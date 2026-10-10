@@ -80,6 +80,7 @@ static const float kEngageStops = 0.15;
 static const float kSettleStops = 0.02;
 static const float kReadableFloor = 1.0 / 1024.0;
 static const uint kReadableSamples = 36u;  // 1/64 of the 64x36 lattice
+static const float kMaxLiftStops = 12.0;  // KCD2 patch: under-range lift bound
 VK_BINDING(5) RWTexture2D<float4> Commit : register(u1);
 
 groupshared uint Histogram[256];
@@ -132,17 +133,28 @@ void main(uint local : SV_GroupIndex) {
         ? smoothstep(-6.0, -4.0, log2(max(gate_fraction, 1e-6)))
         : (ValidCount != 0u && ShoulderCount * 32u >= ValidCount ? 1.0 : 0.0);
     float candidate = 1.0;
-    if (gate_weight > 0.0) {
+    // KCD2 patch (two-sided key): the median/p75 are needed by the under-range
+    // lift below as well, so they are found whenever samples exist.
+    float median_stops = 0.0;
+    float p75_stops = 0.0;
+    if (ValidCount != 0u) {
       const uint middle = (ValidCount - 1u) >> 1u;
+      const uint q75 = (ValidCount * 3u) >> 2u;
       uint cumulative = 0u;
       uint median_bin = 0u;
       uint below = 0u;
+      uint p75_bin = 0u;
+      bool have_median = false;
       [loop]
       for (uint bin = 0u; bin < 256u; ++bin) {
         const uint next = cumulative + Histogram[bin];
-        if (next > middle) {
+        if (!have_median && next > middle) {
           median_bin = bin;
           below = cumulative;
+          have_median = true;
+        }
+        if (next > q75) {
+          p75_bin = bin;
           break;
         }
         cumulative = next;
@@ -153,12 +165,26 @@ void main(uint local : SV_GroupIndex) {
       const float within = GovernorMode >= 2u
           ? (float(middle - below) + 0.5) / float(max(Histogram[median_bin], 1u))
           : 0.5;
-      const float median_stops =
-          -24.0 + (float(median_bin) + within) * (48.0 / 256.0);
+      median_stops = -24.0 + (float(median_bin) + within) * (48.0 / 256.0);
+      p75_stops = -24.0 + (float(p75_bin) + 1.0) * (48.0 / 256.0);
+    }
+    if (gate_weight > 0.0) {
       // Modes 0/1 keep the shipped expression bit for bit.
       candidate = GovernorMode >= 2u
           ? exp2(gate_weight * max(median_stops - log2(0.30), 0.0))
           : max(exp2(median_stops) / 0.30, 1.0);
+    }
+    // KCD2 patch: under-range lift.  A relative-linear source fed before the
+    // game's own exposure (KCD2: AutoExposure flag, no exposure texture, so
+    // feed v2 is unavailable) leaves dark interiors at codes 4-16 in the
+    // proxy, where floor trust and the toe discard most of NR's edit.  Lift
+    // the median toward the same 0.30 key, bounded so the 75th percentile
+    // stays under the encode shoulder and by kMaxLiftStops.  The resolve is a
+    // ratio applied to the original, so output brightness is unchanged.
+    if (GovernorMode >= 2u && ValidCount >= kReadableSamples && candidate <= 1.0) {
+      const float lift = clamp(log2(0.30) - median_stops, 0.0, kMaxLiftStops);
+      const float headroom = max(log2(0.75) - p75_stops, 0.0);
+      candidate = exp2(-min(lift, headroom));
     }
 
     // Commit.  A previous value of 0 is an uninitialized texel (D3D12
